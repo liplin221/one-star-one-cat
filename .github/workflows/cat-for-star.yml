@@ -2,8 +2,9 @@ name: one-star-one-cat
 
 on:
   schedule:
-    # GitHub Actions 的 cron 用 UTC，且高峰期可能延迟。免费账号最短间隔 5 分钟。
-    - cron: '*/10 * * * *'
+    # cron 用 UTC。整点是 GitHub Actions 的高峰期，定时任务可能被直接丢弃，
+    # 所以整体偏移几分钟避开 :00，免费账号最短间隔 5 分钟。
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
