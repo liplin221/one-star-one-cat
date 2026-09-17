@@ -2,150 +2,55 @@
 /**
  * one-star-one-cat
  *
- * 每发现一个新 star，就给这个人送一只猫：
- *   1. 开一个 issue @ 他，他会在 GitHub 收到站内通知
- *   2. 把他的头像和那只猫追加进 README 的猫咪墙
+ * 两种模式，靠环境变量 ISSUE_NUMBER 是否存在来区分：
+ *
+ *   star  模式（定时 / 手动）：给新的 stargazer 开 issue @ 他送猫，并写进 README 猫咪墙
+ *   issue 模式（issue 被创建）：有人在 issue 里喊「I need another cat」时，直接在该 issue 下回复一只猫
  *
  * 只依赖 Node 20 内置 fetch，不需要安装任何 npm 包。
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+
+import { OWNER, REPO, gh, ghJson, BOT_LOGIN } from './lib/github.mjs';
+import { loadJson, saveJson, requestsInWindow, trimRequests } from './lib/state.mjs';
+import { makeCat } from './lib/image.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const CONFIG = {
   seenFile: path.join(ROOT, 'data', 'seen_stargazers.json'),
+  requestsFile: path.join(ROOT, 'data', 'cat-requests.json'),
   readmeFile: path.join(ROOT, 'README.md'),
+  catsDir: path.join(ROOT, 'cats'),
   label: 'cat-delivery',
   // 单轮最多送几只。超出部分下一轮继续，因为只有成功送达才会写进 seen 名单。
   maxPerRun: Number(process.env.MAX_PER_RUN ?? 20),
   stalePageLimit: 2, // 连续扫到这么多页没有新用户就停，避免全量翻页烧配额
-  // 两次开 issue 之间的间隔，躲开 GitHub 的次级限流。批量补发时尤其需要。
-  delayMs: Number(process.env.DELAY_MS ?? 500),
   wallStart: '<!-- CATS_WALL_START -->',
   wallEnd: '<!-- CATS_WALL_END -->',
   dryRun: process.env.DRY_RUN === '1',
-  timeoutMs: Number(process.env.REQUEST_TIMEOUT_MS ?? 8000),
+  delayMs: Number(process.env.DELAY_MS ?? 500), // 躲开 GitHub 次级限流
+  // 点名要猫的冷却：同一用户窗口期内最多几只
+  cooldownHours: Number(process.env.COOLDOWN_HOURS ?? 24),
+  maxPerUser: Number(process.env.MAX_PER_USER ?? 3),
+  trigger: /i\s*need\s+another\s+cat|再来一只猫|还要一只猫/i,
 };
 
-const REPO_FULL = process.env.GITHUB_REPOSITORY ?? process.env.REPO ?? '';
-const TOKEN = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+const ISSUE_NUMBER = process.env.ISSUE_NUMBER ? Number(process.env.ISSUE_NUMBER) : null;
+const MODE = ISSUE_NUMBER ? 'issue' : 'star';
 
-if (!REPO_FULL) {
-  console.error('缺少 GITHUB_REPOSITORY，格式如 liplinli/one-star-one-cat');
-  process.exit(1);
-}
+/** 把猫图变成能在 issue / README 里引用的链接。文生图返回的是 base64，必须落盘。 */
+async function resolveCatUrl(cat, login) {
+  if (!cat.base64) return cat.url;
 
-const [OWNER, REPO] = REPO_FULL.split('/');
-const API = 'https://api.github.com';
-
-function headers(extra = {}) {
-  return {
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'one-star-one-cat',
-    ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
-    ...extra,
-  };
-}
-
-async function gh(pathname, init = {}) {
-  return fetch(`${API}${pathname}`, {
-    ...init,
-    headers: headers(init.headers),
-    signal: AbortSignal.timeout(CONFIG.timeoutMs),
-  });
-}
-
-async function ghJson(pathname, init = {}) {
-  const res = await gh(pathname, init);
-  if (!res.ok) {
-    throw new Error(`GitHub API ${res.status} ${res.statusText} — ${pathname}`);
-  }
-  return res.json();
-}
-
-/** 已送过猫的名单。只记用户名，不记时间，因为 unstar 再 star 会刷新 starred_at。 */
-async function loadSeen() {
-  try {
-    const parsed = JSON.parse(await readFile(CONFIG.seenFile, 'utf8'));
-    return { updatedAt: parsed.updatedAt ?? null, delivered: parsed.delivered ?? {} };
-  } catch {
-    return { updatedAt: null, delivered: {} };
-  }
-}
-
-async function saveSeen(seen) {
-  seen.updatedAt = new Date().toISOString();
-  if (CONFIG.dryRun) return;
-  await writeFile(CONFIG.seenFile, `${JSON.stringify(seen, null, 2)}\n`);
-}
-
-/**
- * stargazers 接口按 star 时间升序排，新 star 在最后一页。
- * 先探总页数，再从最后一页往回翻。
- */
-async function getLastPage() {
-  const res = await gh(`/repos/${OWNER}/${REPO}/stargazers?per_page=1`, {
-    headers: { Accept: 'application/vnd.github.star+json' },
-  });
-  if (!res.ok) throw new Error(`读取 stargazers 失败：${res.status}`);
-  if (!res.headers.get('link')) return 1;
-  const matched = res.headers.get('link').match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
-  return matched ? Number(matched[1]) : 1;
-}
-
-async function getStargazerPage(page) {
-  return ghJson(`/repos/${OWNER}/${REPO}/stargazers?per_page=100&page=${page}`, {
-    headers: { Accept: 'application/vnd.github.star+json' },
-  });
-}
-
-async function collectNewStargazers(seen) {
-  const found = [];
-  const lastPage = await getLastPage();
-  let stale = 0;
-
-  for (let page = lastPage; page >= 1 && stale < CONFIG.stalePageLimit; page -= 1) {
-    const list = await getStargazerPage(page);
-    if (!list.length) break;
-
-    let pageHasNew = false;
-    // 页内同样从末尾开始，新的在后
-    for (let i = list.length - 1; i >= 0; i -= 1) {
-      const user = list[i].user;
-      if (!user?.login || seen.has(user.login)) continue;
-      pageHasNew = true;
-      found.push({
-        login: user.login,
-        url: user.html_url,
-        avatar: user.avatar_url,
-        starredAt: list[i].starred_at ?? null,
-      });
-      if (found.length >= CONFIG.maxPerRun) break;
-    }
-
-    stale = pageHasNew ? 0 : stale + 1;
-    if (found.length >= CONFIG.maxPerRun) break;
-  }
-
-  return found;
-}
-
-/** cataas.com 免 key，还能让猫替你说话。says 接口偶发 500，失败降级成不带字的猫。 */
-async function catFor(login) {
-  const says = encodeURIComponent(`thanks @${login}`);
-  const base = `https://cataas.com/cat/says/${says}`;
-  try {
-    const res = await fetch(base, { signal: AbortSignal.timeout(CONFIG.timeoutMs) });
-    res.body?.cancel();
-    if (res.ok) return `${base}?width=600&random=${Date.now()}`;
-  } catch {
-    /* 降级 */
-  }
-  return `https://cataas.com/cat?width=600&random=${Date.now()}`;
+  await mkdir(CONFIG.catsDir, { recursive: true });
+  const name = `${login}-${Date.now()}.png`;
+  await writeFile(path.join(CONFIG.catsDir, name), Buffer.from(cat.base64, 'base64'));
+  // 此刻还拿不到这次提交的 sha，所以用分支名 + t 参数绕开 raw 的 CDN 缓存
+  return `https://raw.githubusercontent.com/${OWNER}/${REPO}/main/cats/${name}?t=${Date.now()}`;
 }
 
 async function ensureLabel() {
@@ -168,19 +73,34 @@ async function ensureLabel() {
   }
 }
 
-async function deliverCat(user, labelReady) {
+async function commentOnIssue(number, body) {
+  if (CONFIG.dryRun) {
+    console.log(`[dry-run] 回复 #${number}：\n${body}`);
+    return null;
+  }
+  const res = await gh(`/repos/${OWNER}/${REPO}/issues/${number}/comments`, {
+    method: 'POST',
+    body: JSON.stringify({ body }),
+  });
+  if (!res.ok) {
+    throw new Error(`回复 issue 失败 ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function openCatIssue(user, imageUrl, labelReady) {
   const body = [
     `感谢 @${user.login} 点亮了 **${OWNER}/${REPO}** 的星星，这是你的猫：`,
     '',
-    `<img src="${user.cat}" alt="cat for ${user.login}" width="420">`,
+    `<img src="${imageUrl}" alt="cat for ${user.login}" width="420">`,
     '',
-    '> 一颗星，一只猫。unstar 再 star 不会重发，但你可以直接开 issue 点名再要一只。',
+    '> 一颗星，一只猫。想要再来一只？在这个 issue 下面回复 `I need another cat` 就行。',
     '',
     `<sub>由 <a href="https://github.com/${OWNER}/${REPO}">${OWNER}/${REPO}</a> 自动送达</sub>`,
   ].join('\n');
 
   if (CONFIG.dryRun) {
-    console.log(`[dry-run] 会给 @${user.login} 发：${user.cat}`);
+    console.log(`[dry-run] 会给 @${user.login} 发：${imageUrl}`);
     return null;
   }
 
@@ -217,7 +137,7 @@ async function updateCatsWall(users) {
     .reverse()
     .map(
       (u) =>
-        `<a href="${u.url}"><img src="${u.avatar}&s=64" width="32" height="32" alt="${u.login}" title="${u.login}"></a>&nbsp;<img src="${u.cat}" width="96" alt="cat for ${u.login}">&nbsp;&nbsp;`
+        `<a href="${u.url}"><img src="${u.avatar}&s=64" width="32" height="32" alt="${u.login}" title="${u.login}"></a>&nbsp;<img src="${u.imageUrl}" width="96" alt="cat for ${u.login}">&nbsp;&nbsp;`
     )
     .join('\n');
 
@@ -233,11 +153,79 @@ async function updateCatsWall(users) {
   await writeFile(CONFIG.readmeFile, next);
 }
 
-async function main() {
-  const seen = await loadSeen();
+/** stargazers 接口按 star 时间升序排，新 star 在最后一页，所以先探总页数再从后往前翻 */
+async function getLastPage() {
+  const res = await gh(`/repos/${OWNER}/${REPO}/stargazers?per_page=1`, {
+    headers: { Accept: 'application/vnd.github.star+json' },
+  });
+  if (!res.ok) throw new Error(`读取 stargazers 失败：${res.status}`);
+  if (!res.headers.get('link')) return 1;
+  const matched = res.headers.get('link').match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
+  return matched ? Number(matched[1]) : 1;
+}
+
+async function collectNewStargazers(seen) {
+  const found = [];
+  const lastPage = await getLastPage();
+  let stale = 0;
+
+  for (let page = lastPage; page >= 1 && stale < CONFIG.stalePageLimit; page -= 1) {
+    const list = await ghJson(`/repos/${OWNER}/${REPO}/stargazers?per_page=100&page=${page}`, {
+      headers: { Accept: 'application/vnd.github.star+json' },
+    });
+    if (!list.length) break;
+
+    let pageHasNew = false;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const user = list[i].user;
+      if (!user?.login || seen.has(user.login)) continue;
+      pageHasNew = true;
+      found.push({
+        login: user.login,
+        url: user.html_url,
+        avatar: user.avatar_url,
+        starredAt: list[i].starred_at ?? null,
+      });
+      if (found.length >= CONFIG.maxPerRun) break;
+    }
+
+    stale = pageHasNew ? 0 : stale + 1;
+    if (found.length >= CONFIG.maxPerRun) break;
+  }
+
+  return found;
+}
+
+/** 强制补发模式：按用户名直接送猫，绕过 seen 名单，用于「我还想再要一只」 */
+async function getUsersByLogin(logins) {
+  const out = [];
+  for (const login of logins) {
+    const res = await gh(`/users/${login}`);
+    if (!res.ok) {
+      console.warn(`找不到 GitHub 用户 ${login}，跳过`);
+      continue;
+    }
+    const u = await res.json();
+    out.push({ login: u.login, url: u.html_url, avatar: u.avatar_url, starredAt: null });
+  }
+  return out;
+}
+
+async function runStarMode() {
+  const seen = await loadJson(CONFIG.seenFile, { updatedAt: null, delivered: {} });
   console.log(`已送过 ${Object.keys(seen.delivered).length} 只猫`);
 
-  const fresh = await collectNewStargazers(new Set(Object.keys(seen.delivered)));
+  const forcedLogins = (process.env.FORCE_USERS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const fresh = forcedLogins.length
+    ? await getUsersByLogin(forcedLogins)
+    : await collectNewStargazers(new Set(Object.keys(seen.delivered)));
+
+  if (forcedLogins.length) console.log(`强制补发模式：${forcedLogins.join(', ')}`);
+
   if (!fresh.length) {
     console.log('没有新的 star，收工');
     return;
@@ -248,22 +236,87 @@ async function main() {
 
   const delivered = [];
   for (const user of fresh) {
-    user.cat = await catFor(user.login);
-    const issue = await deliverCat(user, labelReady);
+    const cat = await makeCat(user.login);
+    user.imageUrl = await resolveCatUrl(cat, user.login);
+    const issue = await openCatIssue(user, user.imageUrl, labelReady);
     // 失败时不写进 seen，下一轮自然重试，避免永久丢猫
     if (!issue && !CONFIG.dryRun) continue;
-    user.issueUrl = issue?.html_url ?? '';
     delivered.push(user);
-    seen.delivered[user.login] = user.starredAt ?? new Date().toISOString();
+    // 强制补发不登记进名单：已 star 的人本来就在名单里，不受影响；
+    // 没 star 的人以后真点了 star，还能正常收到一次
+    if (!forcedLogins.length) {
+      seen.delivered[user.login] = user.starredAt ?? new Date().toISOString();
+    }
     if (!CONFIG.dryRun) await new Promise((r) => setTimeout(r, CONFIG.delayMs));
   }
 
-  await saveSeen(seen);
+  seen.updatedAt = new Date().toISOString();
+  if (!CONFIG.dryRun) await saveJson(CONFIG.seenFile, seen);
   await updateCatsWall(delivered);
   console.log(`本轮送达 ${delivered.length} 只猫`);
 }
 
-main().catch((err) => {
+async function runIssueMode() {
+  const login = process.env.ISSUE_AUTHOR ?? '';
+  const body = process.env.ISSUE_BODY ?? '';
+  const number = ISSUE_NUMBER;
+
+  if (!CONFIG.trigger.test(body)) {
+    console.log(`#${number} 没有触发词，跳过`);
+    return;
+  }
+  console.log(`@${login} 在 #${number} 里点名要猫`);
+
+  // 同一个 issue 只回一次
+  const comments = await ghJson(`/repos/${OWNER}/${REPO}/issues/${number}/comments?per_page=100`);
+  if (comments.some((c) => c.user?.login === BOT_LOGIN)) {
+    console.log(`#${number} 已经回过猫了，跳过`);
+    return;
+  }
+
+  // 冷却：同一用户窗口期内最多 maxPerUser 只
+  const requests = await loadJson(CONFIG.requestsFile, {});
+  const recent = requestsInWindow(requests, login, CONFIG.cooldownHours);
+  if (recent.length >= CONFIG.maxPerUser) {
+    console.log(`@${login} ${CONFIG.cooldownHours}h 内已要过 ${recent.length} 只，冷却中`);
+    const waitHours = Math.ceil(
+      (CONFIG.cooldownHours * 3600_000 - (Date.now() - Date.parse(recent[0]))) / 3600_000
+    );
+    await commentOnIssue(
+      number,
+      [
+        `@${login} 喵…你最近已经领走 ${recent.length} 只猫了，猫窝快住不下了。`,
+        '',
+        `每 ${CONFIG.cooldownHours} 小时最多 ${CONFIG.maxPerUser} 只，大约 ${waitHours} 小时后再来吧。`,
+      ].join('\n')
+    );
+    return;
+  }
+
+  const cat = await makeCat(login);
+  const imageUrl = await resolveCatUrl(cat, login);
+
+  await commentOnIssue(
+    number,
+    [
+      `@${login} 你的猫来了：`,
+      '',
+      `<img src="${imageUrl}" alt="cat for ${login}" width="420">`,
+      '',
+      `<sub>每 ${CONFIG.cooldownHours} 小时最多再要 ${CONFIG.maxPerUser} 只 · 来源：${cat.source}</sub>`,
+    ].join('\n')
+  );
+
+  requests[login] = [...recent, new Date().toISOString()];
+  if (!CONFIG.dryRun) {
+    await saveJson(CONFIG.requestsFile, trimRequests(requests, CONFIG.cooldownHours));
+  }
+  console.log(`已回复 #${number}，@${login} 本窗口第 ${recent.length + 1} 只`);
+}
+
+const runner = MODE === 'issue' ? runIssueMode : runStarMode;
+
+runner().catch((err) => {
   console.error(err);
   process.exit(1);
 });

@@ -14,6 +14,10 @@ on:
         description: '本轮最多送几只猫'
         type: string
         default: '20'
+      redeliver:
+        description: '点名再送一只猫（GitHub 用户名，多个用逗号分隔）'
+        type: string
+        default: ''
 
 permissions:
   contents: write # 写回 README 猫咪墙和 seen 名单
@@ -41,14 +45,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           MAX_PER_RUN: ${{ inputs.max_per_run || '20' }}
+          FORCE_USERS: ${{ inputs.redeliver }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # 文生图可选。不配就自动用随机猫，功能不受影响
+          IMAGE_PROVIDER: ${{ vars.IMAGE_PROVIDER }}
+          IMAGE_BASE_URL: ${{ vars.IMAGE_BASE_URL }}
+          IMAGE_MODEL: ${{ vars.IMAGE_MODEL }}
+          IMAGE_API_KEY: ${{ secrets.IMAGE_API_KEY }}
         run: node scripts/cat-for-star.mjs
 
       - name: Commit cats wall
         run: |
           git config user.name "cat-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/seen_stargazers.json README.md
+          git add -A
           if git diff --staged --quiet; then
             echo "没有新猫，跳过提交"
           else
