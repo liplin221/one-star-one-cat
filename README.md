@@ -4,7 +4,7 @@
 
 点一下右上角的 Star，大约 10 分钟内，一只随机小猫会自动送到你手上：仓库里会开一个 issue @ 你（你会收到 GitHub 站内通知），同时你的头像和那只猫会被钉在下方的猫咪墙上。
 
-还想要？开一个新 issue，正文里写 `I need another cat`，机器人会直接在这个 issue 下面回你一只新的。
+还想要？开一个新 issue，标题或正文里写 `I need another cat`，机器人会直接在这个 issue 下面回你一只新的。
 
 - 猫从 [cataas.com](https://cataas.com) 随机抓，免 key
 - 每只猫都不一样，猫身上会写着 `thanks @你的名字`
@@ -21,7 +21,7 @@
 
 三种方式，从最省事到最麻烦：
 
-1. **在 issue 里喊一声**（推荐）：新开一个 issue，正文写 `I need another cat`（中文「再来一只猫」也认），机器人直接在这个 issue 下回你一只新猫。
+1. **在 issue 里喊一声**（推荐）：新开一个 issue，标题或正文写 `I need another cat`（中文「再来一只猫」也认），机器人直接在这个 issue 下回你一只新猫。
 2. **点名补发**：`Actions → one-star-one-cat → Run workflow`，在 `redeliver` 里填 GitHub 用户名，多个用逗号分隔。绕过名单直接送，也能给没 star 的朋友空投。
 3. **手动清名单**：把 `data/seen_stargazers.json` 里自己那行删掉，commit 推上去，下一轮自动重送。
 

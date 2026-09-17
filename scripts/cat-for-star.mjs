@@ -258,10 +258,12 @@ async function runStarMode() {
 
 async function runIssueMode() {
   const login = process.env.ISSUE_AUTHOR ?? '';
+  const title = process.env.ISSUE_TITLE ?? '';
   const body = process.env.ISSUE_BODY ?? '';
   const number = ISSUE_NUMBER;
 
-  if (!CONFIG.trigger.test(body)) {
+  // 标题或正文任一命中即可
+  if (!CONFIG.trigger.test(`${title}\n${body}`)) {
     console.log(`#${number} 没有触发词，跳过`);
     return;
   }
